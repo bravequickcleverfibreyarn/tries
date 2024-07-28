@@ -120,6 +120,8 @@ fn path_from_key_crux<'a>(key: &Key, mut node: &'a Node) -> Option<Path<'a>> {
             }
         }
 
+        // beware, some element was written, but none will be dropped
+        // for `usize` and `&` should be no problem
         return None;
     }
 

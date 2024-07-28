@@ -109,14 +109,13 @@ fn path_from_key_crux<'a>(key: &Key, mut node: &'a Node) -> Option<Path<'a>> {
     let mut wr_ix = 0;
     cap[wr_ix].write((usize::MAX, node));
 
-    
     for c in key.chars() {
         if let Some(l) = &node.links {
             if let Some(ix) = index_of_c(l, c) {
                 node = &l[ix];
 
                 wr_ix += 1;
-                cap[wr_ix].write((ix, node));                
+                cap[wr_ix].write((ix, node));
                 continue;
             }
         }
@@ -540,13 +539,12 @@ mod tests_of_units {
             for ke in &kes[..2] {
                 let mut ix = 1;
                 for c in ke.0.chars() {
-                    
                     let pn = path[ix];
                     assert_eq!(0, pn.0);
 
                     let n = pn.1;
                     assert_eq!(c, n.c);
-                    
+
                     ix += 1;
                 }
 
@@ -811,7 +809,7 @@ mod tests_of_units {
                 let mut root = Node::empty();
 
                 const OLD: &str = "touchstone";
-                const NEW: &str = "touch";                
+                const NEW: &str = "touch";
 
                 let old = KeyEntry::new(OLD).unwrap();
                 let new = KeyEntry::new(NEW).unwrap();

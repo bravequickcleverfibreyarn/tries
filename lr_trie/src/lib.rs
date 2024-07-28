@@ -1,6 +1,7 @@
 //! To reduce memory demands of `LrTrie`, operations are not particularly optimal.
 //! If alphabet used became wide enough, some rework using e.g. hashmap would be needed.
 
+use std::mem::transmute;
 use std::ptr;
 use std::string::String;
 use std::vec::Vec;
@@ -93,7 +94,7 @@ pub enum LeftRight {
 
 fn path_from_key<'a>(key: &Key, node: &'a Node) -> Option<Path<'a>> {
     if let Some(path) = path_from_key_crux(key, node) {
-        if path[0].1.lrref() {
+        if path[key.1].1.lrref() {
             return Some(path);
         }
     }
@@ -101,50 +102,30 @@ fn path_from_key<'a>(key: &Key, node: &'a Node) -> Option<Path<'a>> {
 }
 
 fn path_from_key_crux<'a>(key: &Key, mut node: &'a Node) -> Option<Path<'a>> {
-    let mut wr_ix = key.1;
-    let path_len = wr_ix + 1;
+    let path_len = key.1 + 1;
     let mut path = Vec::with_capacity(path_len);
+    let mut cap = path.spare_capacity_mut();
 
-    unsafe { path.set_len(path_len) };
+    let mut wr_ix = 0;
+    cap[wr_ix].write((usize::MAX, node));
 
-    path[wr_ix] = (usize::MAX, node);
-
+    
     for c in key.chars() {
         if let Some(l) = &node.links {
             if let Some(ix) = index_of_c(l, c) {
                 node = &l[ix];
 
-                wr_ix -= 1;
-                path[wr_ix] = (ix, node);
+                wr_ix += 1;
+                cap[wr_ix].write((ix, node));                
                 continue;
             }
         }
 
-        // beware of uncosistent `path` state
-        // len is false since some elements from start are just allocated space
-        // for `usize` and `&` should be no problem (with `Drop`)
         return None;
     }
 
+    unsafe { path.set_len(path_len) };
     Some(path)
-}
-
-fn path_from_entry<'a>(key_node: &'a Node) -> Path<'a> {
-    let mut path = Vec::with_capacity(BASIC_WORD_LEN_GUESS);
-
-    let mut n = unsafe { key_node.lrref.as_ref() }.unwrap();
-
-    while let Some(supn) = unsafe { n.supernode.as_ref() } {
-        let subn_ix = index_of_c(supn.links.as_ref().unwrap(), n.c).unwrap();
-
-        path.push((subn_ix, n));
-
-        n = supn;
-    }
-
-    path.push((usize::MAX, n));
-
-    path
 }
 
 fn index_of_c(links: &Links, c: char) -> Option<usize> {
@@ -165,10 +146,74 @@ fn index_of_c(links: &Links, c: char) -> Option<usize> {
 
 fn mut_node<'a>(node: &Node) -> &'a mut Node {
     let ptr: *const Node = node;
-    unsafe {
-        core::mem::transmute::<*const Node, *mut Node>(ptr)
-            .as_mut()
-            .unwrap()
+    unsafe { transmute::<*const Node, *mut Node>(ptr).as_mut().unwrap() }
+}
+
+// really module level
+fn delete_subnode(n: &Node, subnode_ix: usize) -> bool {
+    let n_mut = mut_node(n);
+
+    let n_links = n_mut.links.as_mut().unwrap();
+    _ = n_links.swap_remove(subnode_ix);
+
+    if n_links.len() == 0 {
+        n_mut.links = None;
+    } else {
+        return true;
+    }
+
+    if n.lrref() {
+        return true;
+    }
+
+    return false;
+}
+
+// really module level
+fn delete_key_side<'a>(entry_path_node: PathNode<'a>, path: &Path<'a>) {
+    let epn_mut = mut_node(&entry_path_node.1);
+    if epn_mut.links() {
+        epn_mut.lrref = ptr::null();
+        return;
+    }
+
+    let mut path_rev = path.iter().rev();
+    _ = path_rev.next();
+
+    let mut subnode_ix = entry_path_node.0;
+    while let Some((sn_ix, n)) = path_rev.next() {
+        if delete_subnode(n, subnode_ix) {
+            break;
+        }
+
+        subnode_ix = *sn_ix;
+    }
+}
+
+// really module level
+fn delete_entry_side(key_node: &Node) {
+    let mut n = unsafe { key_node.lrref.as_ref() }.unwrap();
+
+    if n.links() {
+        mut_node(n).lrref = ptr::null();
+        return;
+    }
+
+    loop {
+        let supn = n.supernode;
+        if supn == ptr::null() {
+            break;
+        }
+
+        let supn = unsafe { supn.as_ref() }.unwrap();
+
+        let subn_ix = index_of_c(supn.links.as_ref().unwrap(), n.c).unwrap();
+
+        if delete_subnode(supn, subn_ix) {
+            break;
+        }
+
+        n = supn;
     }
 }
 
@@ -241,7 +286,7 @@ impl LrTrie {
 
         if let Some(path) = path {
             let mut entry = Vec::with_capacity(BASIC_WORD_LEN_GUESS);
-            let mut node = path[0].1.lrref;
+            let mut node = path[key.1].1.lrref;
 
             loop {
                 let n = unsafe { node.as_ref() }.unwrap();
@@ -278,54 +323,12 @@ impl LrTrie {
     fn delete_crux(&mut self, key: &Key, lr: LeftRight, preserve_ks: bool) -> Result<(), ()> {
         // key side path
         if let Some(ks_path) = path_from_key(key, self.node(lr)) {
-            let ks_epn = ks_path[0];
+            let ks_epn = ks_path[key.1];
 
-            // entry side path
-            let es_path = path_from_entry(ks_epn.1);
-            let es_epn = es_path[0];
+            delete_entry_side(ks_epn.1);
 
-            let deletion_data = [(es_epn, &es_path), (ks_epn, &ks_path)];
-            for data_ix in 0..2 {
-                let (epn, path) = deletion_data[data_ix];
-
-                let epn_mut = mut_node(&epn.1); // sounds
-                if epn_mut.links() {
-                    epn_mut.lrref = ptr::null();
-                    continue;
-                }
-
-                let limit = path.len() - 1;
-                let mut ix = 1;
-
-                let mut subnode_ix = epn.0;
-                loop {
-                    let (sn_ix, n) = path[ix];
-                    let n_mut = mut_node(n); // sounds
-
-                    let n_links = n_mut.links.as_mut().unwrap();
-                    _ = n_links.swap_remove(subnode_ix);
-
-                    if n_links.len() == 0 {
-                        n_mut.links = None;
-                    } else {
-                        break;
-                    }
-
-                    if n.lrref() {
-                        break;
-                    }
-
-                    if ix == limit {
-                        break;
-                    }
-
-                    ix += 1;
-                    subnode_ix = sn_ix;
-                }
-
-                if preserve_ks {
-                    break;
-                }
+            if !preserve_ks {
+                delete_key_side(ks_epn, &ks_path)
             }
 
             Ok(())
@@ -528,31 +531,33 @@ mod tests_of_units {
             assert_eq!(KEYWORD_LEN + 1, path.len());
 
             // path node
-            let root_pn = &path[KEYWORD_LEN];
+            let root_pn = &path[0];
             assert_eq!(usize::MAX, root_pn.0);
 
             let root: *const Node = root_pn.1;
             assert_eq!(l_root as *const Node, root);
 
             for ke in &kes[..2] {
-                let mut ix = KEYWORD_LEN;
+                let mut ix = 1;
                 for c in ke.0.chars() {
-                    ix -= 1;
+                    
                     let pn = path[ix];
                     assert_eq!(0, pn.0);
 
                     let n = pn.1;
                     assert_eq!(c, n.c);
+                    
+                    ix += 1;
                 }
 
-                assert!(path[0].1.lrref());
+                assert!(path[ke.1].1.lrref());
             }
 
             let path = path_fn(&keyhole, &trie.right);
             assert!(path.is_some());
             let path = path.unwrap();
 
-            let h_node = &path[3];
+            let h_node = &path[4];
             assert_eq!('h', h_node.1.c);
 
             assert_eq!(2, h_node.0);
@@ -578,47 +583,6 @@ mod tests_of_units {
 
             let key = Key::new("key").unwrap();
             assert_eq!(None, path_fn(&key, &node));
-        }
-    }
-
-    mod path_from_entry {
-
-        use crate::{path_from_entry as path_fn, Entry, KeyEntry, LrTrie, NULL};
-
-        #[test]
-        fn path_from_entry() {
-            const ENTRY: &str = "JourneyOfDecade";
-
-            let key = KeyEntry::new("A").unwrap();
-            let entry = KeyEntry::new(ENTRY).unwrap();
-            let noise1 = Entry::new("JourneyOfYourLife").unwrap();
-            let noise2 = Entry::new("JourneyOfOurLifes").unwrap();
-
-            let mut trie = LrTrie::new();
-            trie.insert(&noise1, &noise1);
-            trie.insert(&noise2, &noise2);
-            trie.insert(&key, &entry);
-
-            let key_node = &trie.left.links.unwrap()[1];
-
-            let path = path_fn(key_node);
-            assert_eq!(path.len(), ENTRY.len() + 1);
-
-            for (ix, c) in ENTRY.chars().rev().enumerate() {
-                let pn = path[ix];
-
-                assert_eq!(c, pn.1.c);
-
-                let subn_ix = if c == 'D' {
-                    2
-                } else if c == NULL {
-                    usize::MAX
-                } else {
-                    0
-                };
-
-                assert_eq!(subn_ix, pn.0, "{c}");
-            }
         }
     }
 
@@ -847,8 +811,7 @@ mod tests_of_units {
                 let mut root = Node::empty();
 
                 const OLD: &str = "touchstone";
-                const NEW: &str = "touch";
-                const OLD_LEN: usize = OLD.len();
+                const NEW: &str = "touch";                
 
                 let old = KeyEntry::new(OLD).unwrap();
                 let new = KeyEntry::new(NEW).unwrap();
@@ -859,8 +822,8 @@ mod tests_of_units {
                 let old_path = path_from_key_crux(&old, &root).unwrap();
                 let new_path = path_from_key_crux(&new, &root).unwrap();
 
-                assert_eq!(OLD_LEN + 1, old_path.len());
-                assert_eq!(new_path, old_path[OLD_LEN - NEW.len()..]);
+                assert_eq!(OLD.len() + 1, old_path.len());
+                assert_eq!(new_path, old_path[..=NEW.len()]);
             }
         }
 
@@ -981,7 +944,7 @@ mod tests_of_units {
                         assert!(trie.member(&keypad, lr.clone()).is_some());
 
                         let path = path_from_key_crux(&key, trie.node(lr)).unwrap();
-                        let node = path[0].1;
+                        let node = path[key.1].1;
                         let links = node.links.as_ref().unwrap();
                         assert_eq!(2, links.len());
                         let filtered = links.iter().filter(|x| x.c == 'w' || x.c == 'p').count();
